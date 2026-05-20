@@ -18,8 +18,6 @@
 
 declare(strict_types=1);
 
-use Core\Http\Request;
-
 /*
 |--------------------------------------------------------------------------
 | Register The Composer Auto-Loader

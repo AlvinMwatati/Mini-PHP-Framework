@@ -1,0 +1,8 @@
+RewriteEngine On
+
+# Stop processing if the requested file or folder actually exists
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Route everything else to index.php
+RewriteRule ^(.*)$ index.php [L,QSA]

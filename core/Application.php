@@ -6,6 +6,7 @@ namespace Core;
 
 use Core\Http\Request;
 use Core\Http\Response;
+use Core\Routing\Router;
 
 /**
  * The Application class is the heart of the framework.
@@ -19,14 +20,6 @@ use Core\Http\Response;
  *   - Own the service container (dependency injection)
  *   - Register route definitions
  *   - Run middleware pipelines
- *
- * Why a static factory method (create()) instead of new Application()?
- * It makes the construction intent readable:
- *   $app = Application::create(basePath: __DIR__);
- * vs
- *   $app = new Application(__DIR__);
- *
- * The named argument `basePath:` makes call sites self-documenting.
  */
 class Application
 {
@@ -37,6 +30,7 @@ class Application
      * @var string
      */
     protected string $basePath;
+    protected Router $router;
 
     /**
      * Private constructor — force use of Application::create() factory.
@@ -48,6 +42,7 @@ class Application
         // rtrim removes any trailing slash the caller might have included,
         // so we always have a consistent path without a trailing slash.
         $this->basePath = rtrim($basePath, '/\\');
+        $this->router = new Router();
     }
 
     /**
@@ -86,7 +81,36 @@ class Application
     protected function bootstrap(): void
     {
         $this->registerErrorHandling();
+        $this->loadRoutes();
     }
+
+    /**
+     * Load routes from routes/web.php.
+     *
+     * We use variable extraction to inject $router into the routes file.
+     * The routes file uses $router->get(...), $router->post(...) etc.
+     *
+     * Why not just include it?
+     * - extract() lets us pass variables cleanly into the included file's scope.
+     * - The routes file stays free of any globals or statics.
+     * - In Phase 6, you could swap in different route files per environment.
+     */
+    protected function loadRoutes(): void
+    {
+        $router = $this->router;
+        $routesFile = $this->path('routes/web.php');
+ 
+        if (!file_exists($routesFile)) {
+            return; // No routes file yet — don't crash
+        }
+ 
+        // Use a closure to limit the scope of the include.
+        // Variables inside the closure don't leak into Application's scope.
+        (static function (Router $router, string $file): void {
+            require $file;
+        })($router, $routesFile);
+    }
+
 
     /**
      * Handle an incoming HTTP request.
@@ -108,14 +132,7 @@ class Application
         // Build a Request from PHP's superglobals.
         // In Phase 2 we'll flesh out this class fully.
         $request = Request::fromGlobals();
-
-        // Placeholder: in Phase 3 this becomes:
-        //   return $this->router->dispatch($request);
-        return new Response(
-            body: $this->getWelcomePage($request),
-            statusCode: 200,
-            headers: ['Content-Type' => 'text/html; charset=UTF-8']
-        );
+        return $this->router->dispatch($request);
     }
 
     /**
@@ -186,41 +203,6 @@ class Application
     }
 
     /**
-     * A temporary welcome page so we can verify the framework boots.
-     * Delete this in Phase 3 when the Router takes over.
-     */
-    protected function getWelcomePage(Request $request): string
-    {
-        $uri = htmlspecialchars($request->getUri(), ENT_QUOTES, 'UTF-8');
-        $method = htmlspecialchars($request->getMethod(), ENT_QUOTES, 'UTF-8');
-
-        return <<<HTML
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <title>MiniFramework — It works!</title>
-            <style>
-                body { font-family: sans-serif; max-width: 640px; margin: 80px auto; color: #333; }
-                code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
-                .badge { display: inline-block; background: #22c55e; color: white; padding: 4px 10px; border-radius: 99px; font-size: 13px; }
-            </style>
-        </head>
-        <body>
-            <span class="badge">Phase 1 ✓</span>
-            <h1>MiniFramework is running!</h1>
-            <p>The front controller is working. Here's what we know about this request:</p>
-            <ul>
-                <li><strong>Method:</strong> <code>{$method}</code></li>
-                <li><strong>URI:</strong> <code>{$uri}</code></li>
-            </ul>
-            <p>Next: build the <strong>Router</strong> in Phase 3 to handle this URI.</p>
-        </body>
-        </html>
-        HTML;
-    }
-
-    /**
      * Helper to build paths relative to the project root.
      *
      * Usage: $app->path('config/app.php')
@@ -241,4 +223,13 @@ class Application
     {
         return $this->basePath;
     }
+
+    /**
+     * Return the Router instance.
+     */
+        public function getRouter(): Router
+    {
+        return $this->router;
+    }
+
 }
