@@ -7,6 +7,8 @@ namespace Core;
 use Core\Http\Request;
 use Core\Http\Response;
 use Core\Routing\Router;
+use App\Middleware\LoggingMiddleware;
+use App\Middleware\SecurityHeadersMiddleware;
 
 /**
  * The Application class is the heart of the framework.
@@ -81,7 +83,24 @@ class Application
     protected function bootstrap(): void
     {
         $this->registerErrorHandling();
+        $this->registerGlobalMiddleware();
         $this->loadRoutes();
+    }
+
+    /**
+     * Register global middleware — runs on EVERY request.
+     *
+     * Order matters: first registered = outermost layer = runs first on
+     * request in, last on response out.
+     *
+     * Logging first so it wraps everything and can time the full pipeline.
+     * Security headers last (innermost global) so they're added to every
+     * response regardless of what route middleware does.
+     */
+    public function registerGlobalMiddleware(): void
+    {
+        $this->router->addGlobalMiddleware(LoggingMiddleware::class);
+        $this->router->addGlobalMiddleware(SecurityHeadersMiddleware::class);
     }
 
     /**
@@ -132,6 +151,7 @@ class Application
         // Build a Request from PHP's superglobals.
         // In Phase 2 we'll flesh out this class fully.
         $request = Request::fromGlobals();
+
         return $this->router->dispatch($request);
     }
 

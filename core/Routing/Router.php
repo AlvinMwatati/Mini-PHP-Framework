@@ -4,134 +4,71 @@ declare(strict_types=1);
 
 namespace Core\Routing;
 
+use Core\Http\Middleware\Pipeline;
 use Core\Http\Request;
 use Core\Http\Response;
 
 /**
- * The Router — the framework's traffic director.
- *
- * The Router does two distinct jobs:
- *
- *   1. REGISTRATION: Accept route definitions from routes/web.php
- *      $router->get('/users', [UserController::class, 'index']);
- *      $router->post('/users', [UserController::class, 'store']);
- *
- *   2. DISPATCHING: Given a real HTTP request, find the matching route
- *      and call its handler, returning a Response.
- *
- * These two jobs happen at different times:
- *   - Registration happens at boot (index.php startup)
- *   - Dispatching happens per-request (once per HTTP request)
- *
- * The dispatch() method is where the request lifecycle really begins.
- * Everything before this is setup; this is where your actual app runs.
- *
- * Method-chaining API:
- * The registration methods (get, post, etc.) return $this, allowing
- * fluent usage but the cleaner pattern here is they return the Route
- * object so you can chain .name() or .middleware() on the route:
- *
- *   $router->get('/users', [UserController::class, 'index'])
- *          ->name('users.index');
+ * The Router — matches incoming requests to route handlers and
+ * runs them through any registered middleware.
  */
 class Router
 {
-    /**
-     * All registered routes.
-     * @var Route[]
-     */
+    /** @var Route[] */
     private array $routes = [];
 
-    /**
-     * Named routes for URL generation.
-     * @var array<string, Route>
-     */
+    /** @var array<string, Route> */
     private array $namedRoutes = [];
 
-    /**
-     * The route that was matched for the current request.
-     * Stored here so middleware can inspect it.
-     */
     private ?Route $currentRoute = null;
 
+    /**
+     * Global middleware applied to EVERY route.
+     * @var string[]
+     */
+    private array $globalMiddleware = [];
+
     // =========================================================================
-    // Route registration — the public API for routes/web.php
+    // Route registration
     // =========================================================================
 
-    /**
-     * Register a GET route. Also registers HEAD (HTTP spec says GET handlers
-     * must respond to HEAD — same as GET but no body in the response).
-     */
-    public function get(string $pattern, mixed $handler): Route
+    public function get(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['GET', 'HEAD'], $pattern, $handler);
     }
 
-    /**
-     * Register a POST route. Used for creating resources or submitting forms.
-     */
-    public function post(string $pattern, mixed $handler): Route
+    public function post(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['POST'], $pattern, $handler);
     }
 
-    /**
-     * Register a PUT route. Used for full-update of a resource.
-     */
-    public function put(string $pattern, mixed $handler): Route
+    public function put(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['PUT'], $pattern, $handler);
     }
 
-    /**
-     * Register a PATCH route. Used for partial-update of a resource.
-     */
-    public function patch(string $pattern, mixed $handler): Route
+    public function patch(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['PATCH'], $pattern, $handler);
     }
 
-    /**
-     * Register a DELETE route. Used for deleting resources.
-     */
-    public function delete(string $pattern, mixed $handler): Route
+    public function delete(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['DELETE'], $pattern, $handler);
     }
 
-    /**
-     * Register a route that responds to any HTTP method.
-     */
-    public function any(string $pattern, mixed $handler): Route
+    public function any(string $pattern, mixed $handler): PendingRoute
     {
         return $this->addRoute(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'], $pattern, $handler);
     }
 
-    /**
-     * Register a route for specific methods.
-     *
-     * Usage: $router->match(['GET', 'POST'], '/form', [FormController::class, 'handle']);
-     */
-    public function match(array $methods, string $pattern, mixed $handler): Route
+    public function match(array $methods, string $pattern, mixed $handler): PendingRoute
     {
-        return $this->addRoute(
-            array_map('strtoupper', $methods),
-            $pattern,
-            $handler
-        );
+        return $this->addRoute(array_map('strtoupper', $methods), $pattern, $handler);
     }
 
     /**
      * Register a group of routes that share a prefix and/or middleware.
-     *
-     * Usage:
-     *   $router->group(['prefix' => '/api', 'middleware' => ['auth']], function($router) {
-     *       $router->get('/users', [UserController::class, 'index']);
-     *       $router->post('/users', [UserController::class, 'store']);
-     *   });
-     *
-     * The callback receives $this (the router), so nested registrations
-     * apply the group's prefix and middleware automatically.
      *
      * @param array{prefix?: string, middleware?: string[]} $attributes
      */
@@ -140,25 +77,16 @@ class Router
         $prefix     = $attributes['prefix']     ?? '';
         $middleware = $attributes['middleware'] ?? [];
 
-        // We record routes added during $callback by counting before and after.
         $countBefore = count($this->routes);
-
-        // Run the callback — all route registrations inside it happen now.
         $callback($this);
-
-        // Apply the group's prefix and middleware to every route added
-        // during the callback. We slice the routes array to get just the new ones.
         $newRoutes = array_slice($this->routes, $countBefore);
 
         foreach ($newRoutes as $index => $route) {
             $routeIndex = $countBefore + $index;
 
-            // Prepend the prefix to each route's pattern.
-            // rtrim/ltrim ensures no double slashes.
             $newPattern = rtrim($prefix, '/') . '/' . ltrim($route->pattern, '/');
-            $newPattern = rtrim($newPattern, '/') ?: '/'; // Ensure root stays /
+            $newPattern = rtrim($newPattern, '/') ?: '/';
 
-            // Build a new Route with the prefixed pattern and merged middleware.
             $this->routes[$routeIndex] = new Route(
                 methods:    $route->methods,
                 pattern:    $newPattern,
@@ -167,7 +95,6 @@ class Router
                 name:       $route->name,
             );
 
-            // Update named routes index if this route has a name.
             if ($route->name !== null) {
                 $this->namedRoutes[$route->name] = $this->routes[$routeIndex];
             }
@@ -175,119 +102,113 @@ class Router
     }
 
     // =========================================================================
+    // Middleware registration
+    // =========================================================================
+
+    /**
+     * Register a middleware class to run on every single request.
+     *
+     * Call this from Application::bootstrap() to apply framework-wide
+     * middleware (logging, security headers, etc.).
+     *
+     * Order matters: the first middleware added is the OUTERMOST layer
+     * (first to receive the request, last to see the response).
+     */
+    public function addGlobalMiddleware(string $middlewareClass): void
+    {
+        $this->globalMiddleware[] = $middlewareClass;
+    }
+
+    // =========================================================================
     // Dispatching — the per-request lifecycle
     // =========================================================================
 
     /**
-     * Dispatch an incoming request to the appropriate route handler.
+     * Dispatch an incoming request through middleware to the route handler.
      *
-     * This is the core of the router. It:
-     *   1. Loops through all registered routes
-     *   2. Finds one whose pattern matches the request URI
-     *   3. Checks the HTTP method is allowed
-     *   4. Resolves and calls the handler
-     *   5. Returns whatever the handler returned (must be a Response)
+     * The pipeline is:
+     *   global middleware → route middleware → controller
      *
-     * If no route matches → 404 Not Found
-     * If a route matches but wrong method → 405 Method Not Allowed
-     *
-     * @throws \RuntimeException if the handler returns something other than a Response
+     * Both layers use the same Pipeline class. We just pass different
+     * middleware arrays to it.
      */
     public function dispatch(Request $request): Response
     {
         $uri    = $request->getUri();
         $method = $request->getMethod();
 
-        // Track whether any route matched the URI (regardless of method).
-        // This lets us distinguish 404 (no URI match) from 405 (URI matched
-        // but wrong method) — an important distinction for API clients.
         $uriMatched = false;
 
         foreach ($this->routes as $route) {
-            // Try to match the URI pattern. Returns null if no match,
-            // or an array of named captures if it matches.
             $params = $route->match($uri);
 
             if ($params === null) {
-                continue; // This route's pattern doesn't match the URI
+                continue;
             }
 
             $uriMatched = true;
 
-            // The URI matched — now check the HTTP method.
             if (!$route->acceptsMethod($method)) {
-                continue; // Method not allowed — keep looking
+                continue;
             }
 
-            // We have a full match! Store it and call the handler.
             $this->currentRoute = $route;
 
-            return $this->callHandler($route->handler, $request, $params);
+            // The "destination" — the innermost callable at the centre of the onion.
+            // It receives the final $request and calls the actual route handler.
+            $destination = fn(Request $req): Response => $this->callHandler(
+                $route->handler,
+                $req,
+                $params
+            );
+
+            // Build the full middleware stack:
+            //   global middleware + route-specific middleware
+            // Route middleware runs INSIDE global middleware (closer to the controller).
+            $middlewareStack = array_merge($this->globalMiddleware, $route->middleware);
+
+            // Run the request through the pipeline.
+            return (new Pipeline())
+                ->through($middlewareStack)
+                ->run($request, $destination);
         }
 
-        // No full match found. Return 404 or 405.
         if ($uriMatched) {
-            // We found the URI but not the method — 405
             return $this->methodNotAllowed($uri, $method);
         }
 
         return $this->notFound($uri);
     }
 
-    /**
-     * Resolve and call a route handler.
-     *
-     * Handlers can be one of three formats:
-     *
-     *   1. A Closure:
-     *      $router->get('/', function(Request $request) { return Response::html('Hello'); });
-     *
-     *   2. An array [ControllerClass, 'method']:
-     *      $router->get('/users', [UserController::class, 'index']);
-     *
-     *   3. A string 'ControllerClass@method':
-     *      $router->get('/users', 'UserController@index');
-     *      (older Laravel-style syntax, less common with modern PHP)
-     *
-     * In all cases we inject the Request as the first argument, then
-     * the named route parameters (e.g. ['id' => '42']).
-     *
-     * @param array<string, string> $params Named captures from the URI pattern
-     * @throws \RuntimeException if the handler format is unrecognised
-     * @throws \RuntimeException if the handler doesn't return a Response
-     */
+    // =========================================================================
+    // Handler resolution
+    // =========================================================================
+
     private function callHandler(mixed $handler, Request $request, array $params): Response
     {
         $result = match (true) {
-            // Closure / anonymous function
-            $handler instanceof \Closure => $handler($request, $params),
+            $handler instanceof \Closure
+                => $handler($request, $params),
 
-            // [ControllerClass::class, 'method'] array
-            is_array($handler) && count($handler) === 2 => $this->callControllerArray($handler, $request, $params),
+            is_array($handler) && count($handler) === 2
+                => $this->callControllerArray($handler, $request, $params),
 
-            // 'ControllerClass@method' string
-            is_string($handler) && str_contains($handler, '@') => $this->callControllerString($handler, $request, $params),
+            is_string($handler) && str_contains($handler, '@')
+                => $this->callControllerString($handler, $request, $params),
 
             default => throw new \RuntimeException(
-                sprintf(
-                    'Invalid route handler. Expected Closure, [Class, method] array, or "Class@method" string. Got: %s',
-                    get_debug_type($handler)
-                )
+                sprintf('Invalid route handler: %s', get_debug_type($handler))
             )
         };
 
-        // The handler MUST return a Response. If it returned something else
-        // (a string, null, etc.) we wrap it or throw — fail loudly.
         if ($result instanceof Response) {
             return $result;
         }
 
-        // Convenience: if a handler returns a plain string, wrap it in HTML.
         if (is_string($result)) {
             return Response::html($result);
         }
 
-        // Convenience: if a handler returns an array, wrap it as JSON.
         if (is_array($result)) {
             return Response::json($result);
         }
@@ -298,13 +219,6 @@ class Router
         ));
     }
 
-    /**
-     * Handle a [ControllerClass::class, 'method'] handler.
-     *
-     * We instantiate the controller and call the method.
-     * In Phase 6 (service container), we'll replace `new $class()`
-     * with container resolution so dependencies are auto-injected.
-     */
     private function callControllerArray(array $handler, Request $request, array $params): mixed
     {
         [$class, $method] = $handler;
@@ -322,9 +236,6 @@ class Router
         return $controller->$method($request, $params);
     }
 
-    /**
-     * Handle a 'ControllerClass@method' string handler.
-     */
     private function callControllerString(string $handler, Request $request, array $params): mixed
     {
         [$class, $method] = explode('@', $handler, 2);
@@ -360,22 +271,9 @@ class Router
     }
 
     // =========================================================================
-    // URL generation — build URLs for named routes
+    // URL generation
     // =========================================================================
 
-    /**
-     * Generate a URL for a named route.
-     *
-     * Usage:
-     *   // Route registered as: $router->get('/users/{id}', ...)->name('users.show')
-     *   $router->route('users.show', ['id' => 42]); // → '/users/42'
-     *
-     * This is how you avoid hardcoding URLs throughout your app. If the route
-     * pattern changes, you only change it in routes/web.php — all generated
-     * URLs update automatically.
-     *
-     * @param array<string, mixed> $params Values to fill in for {placeholder}s
-     */
     public function route(string $name, array $params = []): string
     {
         if (!isset($this->namedRoutes[$name])) {
@@ -384,7 +282,6 @@ class Router
 
         $pattern = $this->namedRoutes[$name]->pattern;
 
-        // Replace each {placeholder} with the corresponding param value.
         foreach ($params as $key => $value) {
             $pattern = str_replace(
                 ['{' . $key . '}', '{' . $key . '?}'],
@@ -393,10 +290,8 @@ class Router
             );
         }
 
-        // If any optional placeholders remain unreplaced, remove them.
         $pattern = preg_replace('#/\{[^}]+\?\}#', '', $pattern);
 
-        // If any required placeholders remain, the caller forgot a param.
         if (preg_match('#\{[^}]+\}#', $pattern)) {
             throw new \InvalidArgumentException(
                 "Missing parameters for route [{$name}]. Pattern: {$pattern}"
@@ -410,10 +305,7 @@ class Router
     // Helpers
     // =========================================================================
 
-    /**
-     * The actual addRoute implementation — all public methods call this.
-     */
-    private function addRoute(array $methods, string $pattern, mixed $handler): Route
+    private function addRoute(array $methods, string $pattern, mixed $handler): PendingRoute
     {
         $route = new Route(
             methods: $methods,
@@ -421,34 +313,45 @@ class Router
             handler: $handler,
         );
 
+        $index          = count($this->routes);
         $this->routes[] = $route;
 
-        return $route;
+        return new PendingRoute($this, $index);
     }
 
-    /**
-     * Register a named route.
-     * Called internally when a Route's name is set.
-     */
     public function registerNamedRoute(string $name, Route $route): void
     {
         $this->namedRoutes[$name] = $route;
     }
 
     /**
-     * Get all registered routes (useful for debugging/testing).
-     * @return Route[]
+     * Get the Route stored at a specific index (used by PendingRoute).
      */
+    public function getRouteAt(int $index): Route
+    {
+        return $this->routes[$index];
+    }
+
+    /**
+     * Replace the Route stored at a specific index (used by PendingRoute).
+     */
+    public function replaceRouteAt(int $index, Route $route): void
+    {
+        $this->routes[$index] = $route;
+    }
+
     public function getRoutes(): array
     {
         return $this->routes;
     }
 
-    /**
-     * Get the currently matched route.
-     */
     public function currentRoute(): ?Route
     {
         return $this->currentRoute;
+    }
+
+    public function getGlobalMiddleware(): array
+    {
+        return $this->globalMiddleware;
     }
 }
